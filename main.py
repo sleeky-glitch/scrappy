@@ -7,6 +7,7 @@ import pathlib
 import zipfile
 import io
 import datetime
+import json
 from datetime import timedelta
 
 class GujaratSamacharScraper:
@@ -26,16 +27,27 @@ class GujaratSamacharScraper:
         return f"{self.BASE}/view_article/{self.EDITION}/{date}/{pg}/{artid}"
 
     def fetch(self, url, sess):
-        r = sess.get(url, allow_redirects=True, timeout=10)
+        r = sess.get(url, headers=self.HEADERS, allow_redirects=True, timeout=10)
         r.raise_for_status()
         return r
 
-    def first_article_id(self, date, page, sess):
-        r = self.fetch(self.page_url(date, page), sess)
-        m = re.search(r"/(\d+)$", r.url)
-        if not m:
-            raise RuntimeError("Cannot determine first article id")
-        return int(m.group(1)), r.text
+    def get_first_article_id(self, date, page, sess):
+        """Visit the page URL and get redirected to first article"""
+        try:
+            # First visit the page URL
+            page_url = self.page_url(date, page)
+            response = self.fetch(page_url, sess)
+
+            # The response URL should contain the first article ID
+            match = re.search(r'/(\d+)$', response.url)
+            if match:
+                return int(match.group(1))
+            else:
+                raise ValueError(f"Could not find article ID in URL: {response.url}")
+
+        except Exception as e:
+            st.error(f"Error getting first article ID for page {page}: {str(e)}")
+            return None
 
     def get_article_image(self, html_text):
         """Extract the main article image using the current_artical ID"""
@@ -63,14 +75,21 @@ class GujaratSamacharScraper:
 
     def scrape_page(self, date, pg, sess, status_placeholder, stats_placeholder, metadata_dict):
         images = []
+        start_time = time.time()
+
         try:
-            artid, html_text = self.first_article_id(date, pg, sess)
+            # Get the first article ID for this page
+            first_artid = self.get_first_article_id(date, pg, sess)
+            if not first_artid:
+                return [], 0, 0
+
             consecutive_misses = 0
             articles_searched = 0
             images_found = 0
+            current_artid = first_artid
 
             while consecutive_misses < 100:
-                url = self.article_url(date, pg, artid)
+                url = self.article_url(date, pg, current_artid)
                 try:
                     r = self.fetch(url, sess)
                     soup = BeautifulSoup(r.text, 'lxml')
@@ -82,7 +101,7 @@ class GujaratSamacharScraper:
                         # Download image
                         img_response = self.fetch(img_url, sess)
                         if img_response.status_code == 200:
-                            filename = f"{date}_{pg}_{artid}.jpeg"
+                            filename = f"{date}_{pg}_{current_artid}.jpeg"
                             images.append((filename, img_response.content))
                             images_found += 1
 
@@ -90,7 +109,7 @@ class GujaratSamacharScraper:
                             metadata = self.get_article_metadata(soup)
                             metadata['url'] = url
                             metadata['image_filename'] = filename
-                            metadata_dict[f"{pg}_{artid}"] = metadata
+                            metadata_dict[f"{pg}_{current_artid}"] = metadata
 
                     articles_searched += 1
 
@@ -99,7 +118,7 @@ class GujaratSamacharScraper:
                         f"""
                         📄 Current Status:
                         Page: {pg}
-                        Current Article ID: {artid}
+                        Current Article ID: {current_artid}
                         Articles Searched: {articles_searched}
                         Images Found: {images_found}
                         Consecutive Misses: {consecutive_misses}
@@ -122,7 +141,7 @@ class GujaratSamacharScraper:
                     else:
                         raise
 
-                artid += 1
+                current_artid += 1
                 time.sleep(0.6)  # Polite delay
 
         except Exception as e:
