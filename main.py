@@ -38,20 +38,20 @@ class GujaratSamacharScraper:
             page_url = self.page_url(date, page)
             response = self.fetch(page_url, sess)
 
-            # The response URL should contain the first article ID
+            # Extract article ID from the redirected URL
             match = re.search(r'/(\d+)$', response.url)
             if match:
-                return int(match.group(1))
+                return int(match.group(1)), response.text
             else:
                 raise ValueError(f"Could not find article ID in URL: {response.url}")
 
         except Exception as e:
             st.error(f"Error getting first article ID for page {page}: {str(e)}")
-            return None
+            return None, None
 
     def get_article_image(self, html_text):
         """Extract the main article image using the current_artical ID"""
-        soup = BeautifulSoup(html_text, "lxml")
+        soup = BeautifulSoup(html_text, "html.parser")
         img_tag = soup.find('img', id='current_artical')
         if img_tag and 'src' in img_tag.attrs:
             src = img_tag['src']
@@ -79,26 +79,52 @@ class GujaratSamacharScraper:
 
         try:
             # Get the first article ID for this page
-            first_artid = self.get_first_article_id(date, pg, sess)
+            first_artid, first_html = self.get_first_article_id(date, pg, sess)
             if not first_artid:
                 return [], 0, 0
 
-            consecutive_misses = 0
             articles_searched = 0
             images_found = 0
             current_artid = first_artid
+            seen_articles = set([first_artid])  # Keep track of articles we've seen
 
-            while consecutive_misses < 100:
+            # Process the first article
+            img_url = self.get_article_image(first_html)
+            if img_url:
+                img_response = self.fetch(img_url, sess)
+                if img_response.status_code == 200:
+                    filename = f"{date}_{pg}_{current_artid}.jpeg"
+                    images.append((filename, img_response.content))
+                    images_found += 1
+
+                    # Get and store metadata
+                    metadata = self.get_article_metadata(BeautifulSoup(first_html, 'html.parser'))
+                    metadata['url'] = self.article_url(date, pg, current_artid)
+                    metadata['image_filename'] = filename
+                    metadata_dict[f"{pg}_{current_artid}"] = metadata
+
+            # Continue with next articles
+            while True:
+                current_artid += 1
+                articles_searched += 1
+
                 url = self.article_url(date, pg, current_artid)
                 try:
                     r = self.fetch(url, sess)
-                    soup = BeautifulSoup(r.text, 'lxml')
-                    consecutive_misses = 0
+                    soup = BeautifulSoup(r.text, 'html.parser')
+
+                    # Check if we've seen this article before
+                    article_content = soup.find('div', class_='article_text')
+                    if article_content:
+                        content_hash = hash(article_content.get_text(strip=True))
+                        if content_hash in seen_articles:
+                            st.write(f"Found duplicate article on page {pg}, moving to next page")
+                            break
+                        seen_articles.add(content_hash)
 
                     # Get the main article image
                     img_url = self.get_article_image(r.text)
                     if img_url:
-                        # Download image
                         img_response = self.fetch(img_url, sess)
                         if img_response.status_code == 200:
                             filename = f"{date}_{pg}_{current_artid}.jpeg"
@@ -111,8 +137,6 @@ class GujaratSamacharScraper:
                             metadata['image_filename'] = filename
                             metadata_dict[f"{pg}_{current_artid}"] = metadata
 
-                    articles_searched += 1
-
                     # Update status
                     status_placeholder.text(
                         f"""
@@ -121,7 +145,6 @@ class GujaratSamacharScraper:
                         Current Article ID: {current_artid}
                         Articles Searched: {articles_searched}
                         Images Found: {images_found}
-                        Consecutive Misses: {consecutive_misses}
                         """
                     )
 
@@ -131,17 +154,17 @@ class GujaratSamacharScraper:
                         📊 Page Statistics:
                         Success Rate: {(images_found/articles_searched*100):.1f}%
                         Average Time per Article: {(time.time() - start_time)/articles_searched:.2f}s
-                        Estimated Remaining Time: {((time.time() - start_time)/articles_searched * (100-articles_searched)):.0f}s
                         """
                     )
 
                 except requests.HTTPError as e:
                     if e.response.status_code == 404:
-                        consecutive_misses += 1
+                        # If we hit too many 404s, assume we've reached the end
+                        if articles_searched > 100:  # Safeguard against infinite loops
+                            break
                     else:
                         raise
 
-                current_artid += 1
                 time.sleep(0.6)  # Polite delay
 
         except Exception as e:
